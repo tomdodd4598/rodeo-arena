@@ -6,10 +6,12 @@ import numpy as np
 import re
 import scipy.signal as signal
 
+from numpy.linalg import LinAlgError
 from qiskit import IBMQ
+from qiskit.exceptions import QiskitError
 from qiskit.providers import Backend
 from qiskit.providers.aer import AerSimulator
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 
 def rodeo_run(
@@ -36,15 +38,25 @@ def rodeo_run(
         swap_one = '1 ' + all_zero
 
         for _ in range(eval_repeats):
-            circuit = rodeo.rodeo_qsp(
-                num_cycles,
-                hamiltonian,
-                initial_state,
-                qsp_eigvec,
-                target_energy,
-                helpers.rand_gaussian_array(num_cycles, time_stddev),
-            )
-            result = helpers.default_job(circuit, backend, shots, False)
+            while True:
+                time_arr = helpers.rand_gaussian_array(num_cycles, time_stddev)
+                try:
+                    circuit = rodeo.rodeo_qsp(
+                        num_cycles,
+                        hamiltonian,
+                        initial_state,
+                        qsp_eigvec,
+                        target_energy,
+                        time_arr,
+                    )
+                    result = helpers.default_job(circuit, backend, shots, False)
+                except LinAlgError:
+                    print(f'LinAlgError for time array {[str(time) for time in time_arr]}, retrying...')
+                except QiskitError:
+                    print(f'QiskitError for time array {[str(time) for time in time_arr]}, retrying...')
+                else:
+                    break
+
             counts = result.get_counts(circuit)
             success_zero = counts.get(swap_zero, 0)
             success_either = success_zero + counts.get(swap_one, 0)
@@ -52,14 +64,28 @@ def rodeo_run(
             overlap += 2.0 * success_zero - success_either
     else:
         for _ in range(eval_repeats):
-            circuit = rodeo.rodeo_qpe(
-                num_cycles,
-                hamiltonian,
-                initial_state,
-                target_energy,
-                helpers.rand_gaussian_array(num_cycles, time_stddev),
-            )
-            result = helpers.default_job(circuit, backend, shots, False)
+            while True:
+                time_arr = helpers.rand_gaussian_array(num_cycles, time_stddev)
+                try:
+                    print('Starting circuit...')
+                    circuit = rodeo.rodeo_qpe(
+                        num_cycles,
+                        hamiltonian,
+                        initial_state,
+                        target_energy,
+                        time_arr,
+                    )
+                    print('Finishing circuit!')
+                    print('Starting job...')
+                    result = helpers.default_job(circuit, backend, shots, False)
+                    print('Finishing job!')
+                except LinAlgError:
+                    print(f'LinAlgError for time array {[str(time) for time in time_arr]}, retrying...')
+                except QiskitError:
+                    print(f'QiskitError for time array {[str(time) for time in time_arr]}, retrying...')
+                else:
+                    break
+
             counts = result.get_counts(circuit)
             zeros += counts.get(all_zero, 0)
 
@@ -81,17 +107,17 @@ def rodeo_sequence(
         max_iterations: int,
         backend: Backend,
         shots: int
-) -> None:
+) -> Optional[float]:
     qsp = qsp_eigvec is not None
 
-    def rodeo_internal(min_e: float, max_e: float, iteration: int) -> None:
+    def rodeo_internal(min_e: float, max_e: float, iteration: int) -> Optional[float]:
         mean_e = (min_e + max_e) / 2.0
         energy_arr = np.linspace(min_e, max_e, energy_sample_num)
         iteration += 1
 
         time_stddev = time_stddev_generator(iteration)
 
-        print()
+        # print()
         run_arr = helpers.mp_starmap(
             rodeo_run,
             [(
@@ -116,13 +142,17 @@ def rodeo_sequence(
         targets = next_targets(iteration, min_e, max_e, [x[0] for x in run_arr], [x[1] for x in run_arr])
 
         if iteration < max_iterations:
+            res = None
             range_offset = (max_e - min_e) / (2.0 * (narrowing_factor ** iteration))
             for target in targets:
                 target_energy = target if qsp else energy_arr[target]
-                rodeo_internal(target_energy - range_offset, target_energy + range_offset, iteration)
+                res = rodeo_internal(target_energy - range_offset, target_energy + range_offset, iteration)
+            return res if qsp else None
         else:
             if qsp:
-                print(f'Mean overlap: {np.mean([x[1] for x in run_arr])}')
+                mean = np.mean([x[1] for x in run_arr])
+                print(f'Mean overlap: {mean}')
+                return mean
             else:
                 num_estimations = len(targets)
                 if num_estimations == 1:
@@ -132,8 +162,9 @@ def rodeo_sequence(
                     print(f'Eigenvalue estimations: {[energy_str(energy_arr[target]) for target in targets]}')
                 else:
                     print(f'No eigenvalue found near {mean_e}!')
+                return None
 
-    rodeo_internal(min_energy, max_energy, 0)
+    return rodeo_internal(min_energy, max_energy, 0)
 
 
 def write_mathematica_file(file_name: str, x_values: Any, y_values: Any) -> None:
@@ -160,7 +191,7 @@ def rodeo_zeros_plot(
         'Bin Index',
         'Success Rate'
     )
-    file_name = f'rodeo_qpe_scan_{iteration}_{helpers.list_underscore_str(targets)}'
+    file_name = f'output/rodeo_qpe_scan_{iteration}_{helpers.list_underscore_str(targets)}'
     pyplot.savefig(f'{file_name}.svg')
     write_mathematica_file(file_name, x_values, y_values)
 
@@ -183,7 +214,7 @@ def rodeo_overlap_plot(
         'Overlap'
     )
     suffix = f'{target_energy:.2f}'.replace('.', '_')
-    file_name = f'rodeo_qsp_scan_{iteration}_{suffix}'
+    file_name = f'output/rodeo_qsp_scan_{iteration}_{suffix}'
     pyplot.savefig(f'{file_name}.svg')
     write_mathematica_file(file_name, x_values, y_values)
 
@@ -286,7 +317,7 @@ def rodeo_qsp_auto(
         max_iterations: int,
         backend: Backend,
         shots
-) -> None:
+) -> float:
     eigval, eigvec = helpers.nearest_hermitian_eigentuple(hamiltonian, qsp_eigval_approx)
     print(f'Rodeo QSP targeting eigenvalue {eigval:0.05f}...')
 
@@ -295,7 +326,7 @@ def rodeo_qsp_auto(
         rodeo_overlap_plot(iteration, min_e, max_e, energy_sample_num, overlap_arr, eigval)
         return [eigval]
 
-    rodeo_sequence(
+    return rodeo_sequence(
         eval_repeats,
         num_cycles,
         hamiltonian,
@@ -318,10 +349,10 @@ def main():
     backend = provider.get_backend('ibm_nairobi')
     backend_sim = AerSimulator.from_backend(backend)
 
-    phi = 0.0
-    h_0 = helpers.one_qubit_hamiltonian(-0.08496, -0.89134, 0.26536, 0.57205)
-    h_1 = helpers.one_qubit_hamiltonian(-0.84537, 0.00673, -0.29354, 0.18477)
-    hamiltonian = h_0 + phi * h_1
+    # phi = 0.0
+    # h_0 = helpers.one_qubit_hamiltonian(-0.08496, -0.89134, 0.26536, 0.57205)
+    # h_1 = helpers.one_qubit_hamiltonian(-0.84537, 0.00673, -0.29354, 0.18477)
+    # hamiltonian = h_0 + phi * h_1
 
     '''hamiltonian = helpers.two_qubit_hamiltonian(
         -0.68388,
@@ -340,24 +371,29 @@ def main():
         -0.89286,
         -0.32324,
         -0.95432
-    )'''
+    )
 
     helpers.print_hermitian_eigensystem(hamiltonian)
     ground_energy, ground_state = helpers.ground_hermitian_eigentuple(hamiltonian)
 
-    # rodeo_qpe_auto(50, 8, hamiltonian, None, 3.0, -4.0, 4.0, 50, 3.0, 1, 2, None, 2048)
-    # rodeo_qpe_manual(50, 4, hamiltonian, None, -3.0, 3.0, 50, 3.0, 3, None, 2048)
-    for i in range(1, 21):
-        rodeo_qsp_auto(50 * i, i, hamiltonian, None, 10000.0, *((ground_energy,) * 3), 1, 1.0, 1, None, 2048)
-    # for i in [1, 2, 5, 10, 20]:
-        # rodeo_qsp_auto(50 * i, i, hamiltonian, None, 10000.0, *((ground_energy,) * 3), 1, 1.0, 1, backend_sim, 2048)
+    rodeo_qpe_auto(50, 8, hamiltonian, None, 3.0, -4.0, 4.0, 50, 8.0, 2, 4, None, 2048)
+    rodeo_qpe_manual(50, 4, hamiltonian, None, -3.0, 3.0, 50, 3.0, 3, None, 2048)
+    for s in [10000.0]:
+        results = []
+        for i in [10, 15, 20]:
+            print(f'\ns = {s}, N = {i}:')
+            results.append(
+                str(rodeo_qsp_auto(50 * i, i, hamiltonian, None, s, *((ground_energy,) * 3), 1, 1.0, 1, backend_sim, 2048))
+            )
+        results = ','.join(results)
+        print(f'\ns = {s}:\n{{{results}}}')'''
 
-    # hamiltonian = helpers.heisenberg_chain_hamiltonian(8, 1, 3)
-    # zero, one = np.array([1.0, 0.0]), np.array([0.0, 1.0])
-    # initial_state = helpers.recursive_kron(zero, one, zero, one, zero, one, zero, one)
-    # helpers.print_hermitian_extremal_eigenvalues(hamiltonian)
+    hamiltonian = helpers.heisenberg_chain_hamiltonian(8, 1, 3)
+    zero, one = np.array([1.0, 0.0]), np.array([0.0, 1.0])
+    initial_state = helpers.recursive_kron(zero, one, zero, one, zero, one, zero, one)
+    helpers.print_hermitian_extremal_eigenvalues(hamiltonian)
 
-    '''rodeo_qpe_auto(
+    rodeo_qpe_auto(
         25,
         6,
         hamiltonian,
@@ -371,7 +407,7 @@ def main():
         1,
         None,
         2048
-    )'''
+    )
 
 
 if __name__ == '__main__':
